@@ -73,7 +73,8 @@ MemoryRegion::MemoryRegion(bool fine_grain, bool kernarg, bool full_profile,
       mem_props_(mem_props),
       max_single_alloc_size_(0),
       virtual_size_(0),
-      fragment_allocator_(BlockAllocator(*this)) {
+      fragment_allocator_(BlockAllocator(*this)),
+      executable_fragment_allocator_(BlockAllocator(*this, AllocateExecutable)) {
   virtual_size_ = GetPhysicalSize();
 
   // extended_scope_fine_grain and fine_grain memory regions are mutually exclusive
@@ -173,7 +174,7 @@ hsa_status_t MemoryRegion::FreeImpl(const core::DriverMemoryHandle& handle) cons
   // The fragment allocator (KFD/virtio only) keys on the allocation's virtual
   // address, which is the driver handle word for those backends. Other drivers, e.g., XDNA, do not
   // use the fragment allocator.
-  if (fragment_allocator_.free(reinterpret_cast<void*>(handle.handle))) return HSA_STATUS_SUCCESS;
+  if (fragment_free(reinterpret_cast<void*>(handle.handle))) return HSA_STATUS_SUCCESS;
 
   return owner()->driver().FreeMemory(handle);
 }
@@ -181,7 +182,10 @@ hsa_status_t MemoryRegion::FreeImpl(const core::DriverMemoryHandle& handle) cons
 // TODO:  Look into a better name and/or making this process transparent to exporting.
 hsa_status_t MemoryRegion::IPCFragmentExport(void* address) const {
   std::lock_guard<std::recursive_mutex> lock(owner()->agent_memory_lock_);
-  if (!fragment_allocator_.discardBlock(address)) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+  if (!fragment_allocator_.discardBlock(address) &&
+      !executable_fragment_allocator_.discardBlock(address)) {
+    return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+  }
   return HSA_STATUS_SUCCESS;
 }
 
@@ -648,7 +652,10 @@ hsa_status_t MemoryRegion::AssignAgent(void* ptr, size_t size,
   return HSA_STATUS_SUCCESS;
 }
 
-void MemoryRegion::Trim() const { fragment_allocator_.trim(); }
+void MemoryRegion::Trim() const {
+  fragment_allocator_.trim();
+  executable_fragment_allocator_.trim();
+}
 
 void* MemoryRegion::BlockAllocator::alloc(size_t request_size, size_t& allocated_size) const {
   size_t bsize = AlignUp(request_size, block_size());
@@ -657,13 +664,23 @@ void* MemoryRegion::BlockAllocator::alloc(size_t request_size, size_t& allocated
   // on free (see BlockAllocator::free), so the handle is not retained here.
   core::DriverMemoryHandle handle{};
   hsa_status_t err = region_.AllocateImpl(
-      bsize, core::MemoryRegion::AllocateRestrict | core::MemoryRegion::AllocateDirect, 0, &handle);
+      bsize, flags_ | core::MemoryRegion::AllocateRestrict | core::MemoryRegion::AllocateDirect,
+      0, &handle);
   if (err != HSA_STATUS_SUCCESS)
     throw AMD::hsa_exception(err, "MemoryRegion::BlockAllocator::alloc failed.");
   assert(handle.vaddr != nullptr && "Region returned nullptr on success.");
 
   allocated_size = bsize;
   return handle.vaddr;
+}
+
+void MemoryRegion::BlockAllocator::free(void* ptr, size_t length) const {
+  // These are direct KFD/virtio blocks, not fragments. Do not probe either heap:
+  // this also runs while the heaps are being destroyed in reverse member order.
+  core::DriverMemoryHandle handle{};
+  handle.handle = reinterpret_cast<uint64_t>(ptr);
+  handle.size = length;
+  region_.owner()->driver().FreeMemory(handle);
 }
 
 }  // namespace amd
